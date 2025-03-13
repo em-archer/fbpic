@@ -314,7 +314,7 @@ class DonutLikeLaguerreGaussTransverseProfile( LaserTransverseProfile ):
     laser."""
 
     def __init__( self, p, m, waist, zf=0., lambda0=0.8e-6,
-                  propagation_direction=1 ):
+                  propagation_direction=1, RPLBcomponent=None ):
         """
         Define the complex transverse profile of a donut-like Laguerre-Gauss
         laser.
@@ -398,6 +398,7 @@ class DonutLikeLaguerreGaussTransverseProfile( LaserTransverseProfile ):
         self.inv_zr = 1./zr
         self.zf = zf
         self.w0 = waist
+        self.RPLBcomponent=RPLBcomponent
 
     def evaluate( self, x, y, z ):
         """
@@ -413,16 +414,23 @@ class DonutLikeLaguerreGaussTransverseProfile( LaserTransverseProfile ):
         scaled_radius = np.sqrt( scaled_radius_squared )
         theta = np.angle( x + 1.j*y )
         # Calculate the argument of the complex exponential
-        exp_argument = - 1.j*self.m*theta \
-            - (x**2 + y**2) / (self.w0**2 * diffract_factor) \
-            - 1.j*(2*self.p + abs(self.m))*psi # *Additional* Gouy phase
+        if self.RPLBcomponent==None:
+            exp_argument = - 1.j*self.m*theta \
+                - (x**2 + y**2) / (self.w0**2 * diffract_factor) \
+                - 1.j*(2*self.p + abs(self.m))*psi # *Additional* Gouy phase
+        else:
+            exp_argument = - (x**2 + y**2) / (self.w0**2 * diffract_factor) \
+                - 1.j*(2*self.p + abs(self.m))*psi # *Additional* Gouy phase
         # Get the transverse profile
         profile = np.exp(exp_argument) / diffract_factor \
             * scaled_radius**abs(self.m) \
             * self.laguerre_pm(scaled_radius_squared)
         # Scale the amplitude, so that the pulse energy is independent of m and p
         profile *= self.scaled_amplitude
-
+        if self.RPLBcomponent=='x':
+            profile *= np.cos(theta)
+        elif self.RPLBcomponent=='y':
+            profile *= np.sin(theta)
         return profile
 
     def squared_profile_integral(self):

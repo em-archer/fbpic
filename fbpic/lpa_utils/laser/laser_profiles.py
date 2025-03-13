@@ -7,12 +7,30 @@ It defines a set of common laser profiles.
 """
 import numpy as np
 from scipy.constants import c, m_e, e, epsilon_0
+from scipy import interpolate
+from scipy.special import genlaguerre
+from scipy.fft import fft as fft
+from scipy.fft import fft2 as fft2
+from scipy.fft import ifft as ifft
+from scipy.fft import ifft2 as ifft2
+from scipy.fft import fftshift, ifftshift, fftfreq
 import h5py
 import numba
 from .longitudinal_laser_profiles import GaussianChirpedLongitudinalProfile
 from .transverse_laser_profiles import GaussianTransverseProfile, \
     LaguerreGaussTransverseProfile, DonutLikeLaguerreGaussTransverseProfile, \
     FlattenedGaussianTransverseProfile
+import matplotlib.pyplot as plt
+    
+"DEFINE CONSTANTS"
+cm = 1E-2
+mm = 1E-3
+um = 1E-6
+nm = 1E-9
+ps = 1E-12
+fs = 1E-15
+mJ = 1E-3
+c = 2.998E8
 
 # Generic classes
 # ---------------
@@ -906,16 +924,15 @@ class FromLasyFileLaser( LaserProfile ):
 
         # Check lasy version
         valid_version = False
-        if ('software' in f.attrs) and ('softwareVersion' in f.attrs):
-            software = f.attrs['software'].decode()
+        if ('softwareVersion' in f.attrs):
             version_string = f.attrs['softwareVersion'].decode()
             version_list = tuple(int(number) for number in version_string.split('.'))
-            if (software == "lasy") and (version_list >= (0,3,0)):
+            if version_list >= (0,3,0):
                 valid_version = True
         if not valid_version:
             raise RuntimeError(
                 "The `lasy` version that was used to create the file %s "
-                "is obsolete and not supported by FBPIC.\nPlease upgrade your lasy "
+                "is obsolete and not supported by FBPIC. Please upgrade your lasy "
                 "version to at least 0.3.0 (e.g. with `pip install --upgrade lasy`) "
                 "and re-create the file %s." %(filename, filename) )
 
@@ -1063,3 +1080,348 @@ class FromLasyFileLaser( LaserProfile ):
         ))
 
         return( (E * self.pol[0]).real, (E * self.pol[1]).real )
+
+
+
+
+# Class for custom pulse from 2D profile
+# ---------------
+
+class CustomPulse( LaserProfile ):
+    "E. Archer, May 2022"
+    """Class that calculates a laser pulse train by interpolating input files from FBPIC simulation  ."""
+    """Modified from Oscar's code to allow for complex profiles where real and imaginary parts are tracked separately  ."""
+
+    def __init__( self, theta_pol=0., propagation_direction=1, E2D=None):
+        """
+        Parameters
+        ----------
+        theta_pol: float (in radian), optional
+           The angle of polarization with respect to the x axis.
+        propagation_direction: int, optional
+            Indicates in which direction the laser propagates.
+            This should be either 1 (laser propagates towards positive z)
+            or -1 (laser propagates towards negative z).
+        """
+        # Initialize propagation direction
+        LaserProfile.__init__(self, propagation_direction)
+
+        # Store the parameters
+        self.E0x = np.cos(theta_pol) 
+        self.E0y = np.sin(theta_pol)
+
+        # Input files
+        self.E2D=E2D
+
+        print('---Initalizing custom pulse---')
+
+    def E_field( self, x, y, z, t):
+     
+        prop_dir = self.propag_direction
+
+        profile=np.zeros_like((prop_dir*(z) - c*t),dtype="complex_")
+        
+        for n in range(profile.shape[2]):
+            E2Dreal = self.E2D((prop_dir*(z - c*t))[:,0,0],np.sqrt(x**2 + y**2)[0,:,0]).real
+            E2Dimag = self.E2D((prop_dir*(z - c*t))[:,0,0],np.sqrt(x**2 + y**2)[0,:,0]).imag
+            profile[:,:,n]=E2Dreal + 1.j * (E2Dimag)
+            
+        # Set laser polarization from input deck
+        Ex = self.E0x * profile
+        Ey = self.E0y * profile
+        return( Ex.real, Ey.real )
+
+
+
+class RadiallyPolarisedLaser( LaserProfile ):
+        """Class that calculates a radially polarised pulse from donut-like Laguerre-Gauss pulses."""
+
+        def __init__( self, a0, waist, tau, z0, zf=None,
+                        lambda0=0.8e-6, cep_phase=0., propagation_direction=1 ):
+            """
+            Define a radially-polarized donut-like Laguerre-Gauss laser profile.
+
+            Unlike the :any:`LaguerreGaussLaser` profile, this
+            profile has a phase which depends on the azimuthal angle
+            :math:`\\theta` (cork-screw pattern), and an intensity profile which
+            is independent on :math:`\\theta` (donut-like).
+
+            More precisely, the electric field **near the focal plane**
+            is given by:
+
+            .. math::
+
+                E(\\boldsymbol{x},t) = a_0\\times E_0 \, f(r) \,
+                \exp\left( -\\frac{r^2}{w_0^2} - \\frac{(z-z_0-ct)^2}{c^2\\tau^2}
+                \\right) \cos[ k_0( z - z_0 - ct ) - m\\theta - \phi_{cep} ]
+
+                \mathrm{with} \qquad f(r) =
+                \sqrt{\\frac{p!}{(|m|+p)!}}
+                \\left( \\frac{\sqrt{2}r}{w_0} \\right)^{|m|}
+                L^{|m|}_p\\left( \\frac{2 r^2}{w_0^2} \\right)
+
+            where :math:`L^m_p` is a Laguerre polynomial,
+            :math:`k_0 = 2\pi/\\lambda_0` is the wavevector and where
+            :math:`E_0 = m_e c^2 k_0 / q_e`.
+
+            (For more info, see
+            `Siegman, Lasers (1986) <https://www.osapublishing.org/books/bookshelf/lasers.cfm>`_,
+            Chapter 16: Wave optics and Gaussian beams)
+
+            .. note::
+
+                The additional terms that arise **far from the focal plane**
+                (Gouy phase, wavefront curvature, ...) are not included in the above
+                formula for simplicity, but are of course taken into account by
+                the code, when initializing the laser pulse away from the focal plane.
+
+            .. warning::
+                The above formula depends on a parameter :math:`m`
+                (see documentation below). In order to be properly resolved by
+                the simulation, a Laguerre-Gauss profile with a given :math:`m`
+                requires the azimuthal modes from :math:`0` to :math:`|m|+1`.
+                (i.e. the number of required azimuthal modes is ``Nm=|m|+2``)
+
+            Parameters
+            ----------
+
+            p: int
+                The order of the Laguerre polynomial. (Increasing ``p`` increases
+                the number of "rings" in the radial intensity profile of the laser.)
+
+            m: int (positive or negative)
+                The azimuthal order of the pulse. The laser phase in a given
+                transverse plane varies as :math:`m \\theta`.
+
+            a0: float (dimensionless)
+                The amplitude of the pulse, defined so that the total
+                energy of the pulse is the same as that of a Gaussian pulse
+                with the same :math:`a_0`, :math:`w_0` and :math:`\\tau`.
+                (i.e. The energy of the pulse is independent of ``p`` and ``m``.)
+
+            waist: float (in meter)
+                Laser waist at the focal plane, defined as :math:`w_0` in the
+                above formula.
+
+            tau: float (in second)
+                The duration of the laser (in the lab frame),
+                defined as :math:`\\tau` in the above formula.
+
+            z0: float (in meter)
+                The initial position of the centroid of the laser
+                (in the lab frame), defined as :math:`z_0` in the above formula.
+
+            zf: float (in meter), optional
+                The position of the focal plane (in the lab frame).
+                If ``zf`` is not provided, the code assumes that ``zf=z0``, i.e.
+                that the laser pulse is at the focal plane initially.
+
+            theta_pol: float (in radian), optional
+               The angle of polarization with respect to the x axis.
+
+            lambda0: float (in meter), optional
+                The wavelength of the laser (in the lab frame), defined as
+                :math:`\\lambda_0` in the above formula.
+                Default: 0.8 microns (Ti:Sapph laser).
+
+            cep_phase: float (in radian), optional
+                The Carrier Enveloppe Phase (CEP), defined as :math:`\phi_{cep}`
+                in the above formula (i.e. the phase of the laser
+                oscillation, at the position where the laser enveloppe is maximum)
+
+            propagation_direction: int, optional
+                Indicates in which direction the laser propagates.
+                This should be either 1 (laser propagates towards positive z)
+                or -1 (laser propagates towards negative z).
+            """
+            # Initialize propagation direction
+            LaserProfile.__init__(self, propagation_direction)
+
+            # Set and store a number of parameters for the laser
+            k0 = 2 * np.pi / lambda0
+            E0 = a0 * m_e * c ** 2 * k0 / e
+            # Store polarisation of 2 components
+            self.E0x = E0
+            self.E0y = E0
+            # If no focal plane position is given, use z0
+            if zf is None:
+                zf = z0
+            # Initialize a Gaussian longitudinal profile with zero chirp
+            self.longitudinal_profile = GaussianChirpedLongitudinalProfile(
+                tau=tau, z0=z0, lambda0=lambda0, cep_phase=cep_phase,
+                phi2_chirp=0., propagation_direction=self.propag_direction)
+            # Initialize a donut-like Laguerre-Gauss transverse profile
+            self.transverse_profile_x = DonutLikeLaguerreGaussTransverseProfile(
+                p=0, m=1, waist=waist, zf=zf, lambda0=lambda0,
+                propagation_direction=self.propag_direction, RPLBcomponent='x')
+            self.transverse_profile_y = DonutLikeLaguerreGaussTransverseProfile(
+                p=0, m=1, waist=waist, zf=zf, lambda0=lambda0,
+                propagation_direction=self.propag_direction, RPLBcomponent='y')
+            # Inherit GPU capability of the individual profiles
+            self.gpu_capable = self.longitudinal_profile.gpu_capable and \
+                               self.transverse_profile_x.gpu_capable and \
+                               self.transverse_profile_y.gpu_capable
+
+        def E_field(self, x, y, z, t):
+            """
+            See the docstring of LaserProfile.E_field
+            """
+            # The laser profile is constructed by combining a complex
+            # longitudinal and transverse profile, which is valid under the
+            # paraxial approximation.
+            profile_x = self.longitudinal_profile.evaluate(z, t) * \
+                      self.transverse_profile_x.evaluate(x, y, z)
+            profile_y = self.longitudinal_profile.evaluate(z, t) * \
+                      self.transverse_profile_y.evaluate(x, y, z)
+            # Get the projection along x and y, with the correct polarization
+            Ex = self.E0x * profile_x
+            Ey = self.E0y * profile_y
+
+            return (Ex.real, Ey.real)
+        
+        
+class LinearlyPolarisedLaser( LaserProfile ):
+        """Class that calculates a linearly polarised pulse from donut-like Laguerre-Gauss pulses."""
+
+        def __init__( self, a0, waist, tau, z0, zf=None,
+                        lambda0=0.8e-6, cep_phase=0., propagation_direction=1 ):
+            """
+            Define a linearly-polarized donut-like Laguerre-Gauss laser profile.
+
+            Unlike the :any:`LaguerreGaussLaser` profile, this
+            profile has a phase which depends on the azimuthal angle
+            :math:`\\theta` (cork-screw pattern), and an intensity profile which
+            is independent on :math:`\\theta` (donut-like).
+
+            More precisely, the electric field **near the focal plane**
+            is given by:
+
+            .. math::
+
+                E(\\boldsymbol{x},t) = a_0\\times E_0 \, f(r) \,
+                \exp\left( -\\frac{r^2}{w_0^2} - \\frac{(z-z_0-ct)^2}{c^2\\tau^2}
+                \\right) \cos[ k_0( z - z_0 - ct ) - m\\theta - \phi_{cep} ]
+
+                \mathrm{with} \qquad f(r) =
+                \sqrt{\\frac{p!}{(|m|+p)!}}
+                \\left( \\frac{\sqrt{2}r}{w_0} \\right)^{|m|}
+                L^{|m|}_p\\left( \\frac{2 r^2}{w_0^2} \\right)
+
+            where :math:`L^m_p` is a Laguerre polynomial,
+            :math:`k_0 = 2\pi/\\lambda_0` is the wavevector and where
+            :math:`E_0 = m_e c^2 k_0 / q_e`.
+
+            (For more info, see
+            `Siegman, Lasers (1986) <https://www.osapublishing.org/books/bookshelf/lasers.cfm>`_,
+            Chapter 16: Wave optics and Gaussian beams)
+
+            .. note::
+
+                The additional terms that arise **far from the focal plane**
+                (Gouy phase, wavefront curvature, ...) are not included in the above
+                formula for simplicity, but are of course taken into account by
+                the code, when initializing the laser pulse away from the focal plane.
+
+            .. warning::
+                The above formula depends on a parameter :math:`m`
+                (see documentation below). In order to be properly resolved by
+                the simulation, a Laguerre-Gauss profile with a given :math:`m`
+                requires the azimuthal modes from :math:`0` to :math:`|m|+1`.
+                (i.e. the number of required azimuthal modes is ``Nm=|m|+2``)
+
+            Parameters
+            ----------
+
+            p: int
+                The order of the Laguerre polynomial. (Increasing ``p`` increases
+                the number of "rings" in the radial intensity profile of the laser.)
+
+            m: int (positive or negative)
+                The azimuthal order of the pulse. The laser phase in a given
+                transverse plane varies as :math:`m \\theta`.
+
+            a0: float (dimensionless)
+                The amplitude of the pulse, defined so that the total
+                energy of the pulse is the same as that of a Gaussian pulse
+                with the same :math:`a_0`, :math:`w_0` and :math:`\\tau`.
+                (i.e. The energy of the pulse is independent of ``p`` and ``m``.)
+
+            waist: float (in meter)
+                Laser waist at the focal plane, defined as :math:`w_0` in the
+                above formula.
+
+            tau: float (in second)
+                The duration of the laser (in the lab frame),
+                defined as :math:`\\tau` in the above formula.
+
+            z0: float (in meter)
+                The initial position of the centroid of the laser
+                (in the lab frame), defined as :math:`z_0` in the above formula.
+
+            zf: float (in meter), optional
+                The position of the focal plane (in the lab frame).
+                If ``zf`` is not provided, the code assumes that ``zf=z0``, i.e.
+                that the laser pulse is at the focal plane initially.
+
+            theta_pol: float (in radian), optional
+               The angle of polarization with respect to the x axis.
+
+            lambda0: float (in meter), optional
+                The wavelength of the laser (in the lab frame), defined as
+                :math:`\\lambda_0` in the above formula.
+                Default: 0.8 microns (Ti:Sapph laser).
+
+            cep_phase: float (in radian), optional
+                The Carrier Enveloppe Phase (CEP), defined as :math:`\phi_{cep}`
+                in the above formula (i.e. the phase of the laser
+                oscillation, at the position where the laser enveloppe is maximum)
+
+            propagation_direction: int, optional
+                Indicates in which direction the laser propagates.
+                This should be either 1 (laser propagates towards positive z)
+                or -1 (laser propagates towards negative z).
+            """
+            # Initialize propagation direction
+            LaserProfile.__init__(self, propagation_direction)
+
+            # Set and store a number of parameters for the laser
+            k0 = 2 * np.pi / lambda0
+            E0 = a0 * m_e * c ** 2 * k0 / e
+            # Store polarisation of 2 components
+            self.E0x = E0
+            self.E0y = 0
+            # If no focal plane position is given, use z0
+            if zf is None:
+                zf = z0
+            # Initialize a Gaussian longitudinal profile with zero chirp
+            self.longitudinal_profile = GaussianChirpedLongitudinalProfile(
+                tau=tau, z0=z0, lambda0=lambda0, cep_phase=cep_phase,
+                phi2_chirp=0., propagation_direction=self.propag_direction)
+            # Initialize a donut-like Laguerre-Gauss transverse profile
+            self.transverse_profile_x = DonutLikeLaguerreGaussTransverseProfile(
+                p=0, m=1, waist=waist, zf=zf, lambda0=lambda0,
+                propagation_direction=self.propag_direction, RPLBcomponent='x')
+            self.transverse_profile_y = DonutLikeLaguerreGaussTransverseProfile(
+                p=0, m=1, waist=waist, zf=zf, lambda0=lambda0,
+                propagation_direction=self.propag_direction, RPLBcomponent='y')
+            # Inherit GPU capability of the individual profiles
+            self.gpu_capable = self.longitudinal_profile.gpu_capable and \
+                               self.transverse_profile_x.gpu_capable and \
+                               self.transverse_profile_y.gpu_capable
+
+        def E_field(self, x, y, z, t):
+            """
+            See the docstring of LaserProfile.E_field
+            """
+            # The laser profile is constructed by combining a complex
+            # longitudinal and transverse profile, which is valid under the
+            # paraxial approximation.
+            profile_x = self.longitudinal_profile.evaluate(z, t) * \
+                      self.transverse_profile_x.evaluate(x, y, z)
+            profile_y = self.longitudinal_profile.evaluate(z, t) * \
+                      self.transverse_profile_y.evaluate(x, y, z)
+            # Get the projection along x and y, with the correct polarization
+            Ex = self.E0x * (profile_x + profile_y)
+            Ey = self.E0y * profile_y
+
+            return (Ex.real, Ey.real)
